@@ -13,14 +13,9 @@ import ollama
 
 from tenacity import (
     retry,
+    retry_if_exception,
     stop_after_attempt,
     wait_exponential,
-    retry_if_exception_type,
-)
-from lightrag.exceptions import (
-    APIConnectionError,
-    RateLimitError,
-    APITimeoutError,
 )
 from lightrag.api import __api_version__
 
@@ -199,12 +194,45 @@ def _ollama_usage_counts(payload: Any) -> dict[str, int] | None:
     }
 
 
+# Ollama's client funnels every failure through ``ollama.ResponseError`` -- both
+# the ones that reached an HTTP response and the ones that never did -- so the
+# retry predicate has to read ``status_code`` rather than match on type. Only
+# 429 and the 5xx family are transient (a model still loading, a server
+# restarting, a proxy in front of either); 400/401/403/404/422 is a property of
+# the request or the configuration, and re-running it re-buys the same failure.
+# ``status_code`` is negative when no response was ever received, which is
+# exactly the transport failure this loop exists to absorb.
+_TRANSIENT_OLLAMA_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
+
+
+def _is_retryable_ollama_error(error: BaseException) -> bool:
+    """tenacity predicate: retry transient Ollama failures, fail fast otherwise.
+
+    Replaces a predicate that matched ``lightrag.exceptions``' httpx-shaped
+    ``RateLimitError`` / ``APIConnectionError`` / ``APITimeoutError``. Nothing in
+    LightRAG ever raises those, and the ollama client cannot produce them, so the
+    predicate never matched anything and the three attempts it declares never
+    happened -- a transient 503 or a refused connection failed the whole
+    extraction on the first try. A non-``ResponseError`` stays fatal, which keeps
+    ``InvalidResponseError`` out of the loop as documented above.
+    """
+    if not isinstance(error, ollama.ResponseError):
+        return False
+    status_code = getattr(error, "status_code", None)
+    if status_code is None or status_code < 0:
+        return True
+    return status_code in _TRANSIENT_OLLAMA_STATUS_CODES
+
+
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=4, max=10),
-    retry=retry_if_exception_type(
-        (RateLimitError, APIConnectionError, APITimeoutError)
-    ),
+    retry=retry_if_exception(_is_retryable_ollama_error),
+    # Re-raise the provider's own error once the attempts are spent, rather than
+    # wrapping it in tenacity's opaque ``RetryError``: the pipeline's FAILED
+    # summary renders the exception message, and "status code: 503" is the
+    # actionable half. Same reasoning as ``_error_utils``.
+    reraise=True,
 )
 async def _ollama_model_if_cache(
     model,
